@@ -31,6 +31,8 @@ This project is a **wireless IR marker tracking prototype** built with **ESP32-S
 
 ## 1. Hardware
 
+![alt text](img/camera_module.png)
+
 ### 1.1 Top-level diagram
 
 ```mermaid
@@ -59,7 +61,7 @@ flowchart LR
 | OV5640 camera module (Adafruit OV5640 breakout, DVP/parallel) | 2 | One per camera node |
 | IR-pass filter (visible-blocking) | 2 | Mounted in front of each lens |
 | IR marker(s) | 1+ | Active IR LED markers recommended for strong contrast |
-| Stable 5V power (USB) | 2–3 | Use good cables; camera + radio can spike current |
+| Stable 5V power (USB) | 2–3 ||
 | Jumper wires / short ribbon | — | Keep DVP wires short to reduce timing/noise issues |
 | Optional: rigid bar / mounts / tripods | 1 | Stable baseline improves triangulation accuracy |
 
@@ -189,6 +191,8 @@ X,Y,Z = <X> <Y> <Z> (m)
 
 ## 3. Testing and results
 
+### Debug interface
+![alt text](img/debug.png)
 
 Performance depends on:
 - capture resolution (QVGA vs VGA)
