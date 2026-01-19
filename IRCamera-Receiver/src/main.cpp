@@ -94,7 +94,7 @@ struct MarkerHeader {
 static constexpr uint32_t MKRP_MAGIC = 0x4D4B5250UL;
 
 // ===================== Stereo parameters =====================
-// Intrinsics (from your JSON)
+// Intrinsics (from calibration JSON)
 static constexpr float fx = 289.6279631884157f;
 static constexpr float fy = 287.9244412454326f;
 static constexpr float cx = 301.73071808653646f;
@@ -105,7 +105,7 @@ static constexpr float B  = 0.463f;
 
 // If your senders transmit QVGA coords (0..319,0..239) but intrinsics are VGA,
 // set to 2 to scale up: x_vga = x_in * 2.
-static constexpr int INPUT_COORD_SCALE = 2;   // 1 for VGA coords, 2 for QVGA->VGA
+static constexpr int INPUT_COORD_SCALE = 1;   // 1 for VGA coords, 2 for QVGA->VGA
 
 // Matching constraint: abs(yL - yR) <= 20 pixels (after scaling)
 static constexpr int Y_MATCH_TOL = 20;

@@ -5,6 +5,7 @@
 #include "camera_app.h"
 #include "detect_state.h"
 #include "espnow_sender.h"
+#include "config.h"
 
 #include "img_converters.h"
 #include "freertos/FreeRTOS.h"
@@ -14,21 +15,21 @@
 #include <Arduino.h>
 #include <cstring>
 
-// ===================== Source (camera) resolution (QVGA) =====================
+// ===================== Source (camera) resolution (VGA) =====================
 static constexpr int SRC_W = 640;
 static constexpr int SRC_H = 480;
 
 // ===================== Decode scale for detection =====================
-// QVGA -> 2X downscale => 160x120
+// VGA -> 2X downscale => 420x240
 static constexpr jpg_scale_t DECODE_SCALE = JPG_SCALE_2X;
 static constexpr int SCALE_DIV = 2;
 
 // Derived detection resolution
-static constexpr int DET_W = SRC_W / SCALE_DIV;  // 160
-static constexpr int DET_H = SRC_H / SCALE_DIV;  // 120
+static constexpr int DET_W = SRC_W / SCALE_DIV;  // 420
+static constexpr int DET_H = SRC_H / SCALE_DIV;  // 240
 
 // ===================== Threshold / blob filtering =====================
-static constexpr uint8_t  LUMA_THR = 75;     // tune 160..240
+static constexpr uint8_t  LUMA_THR = 75;
 static constexpr uint32_t MIN_AREA = 1;       // tiny markers
 static constexpr uint32_t MAX_AREA = 1500;    // reject glare
 

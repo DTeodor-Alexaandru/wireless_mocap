@@ -39,8 +39,8 @@ static constexpr framesize_t CAM_FRAME_SIZE = FRAMESIZE_VGA; // 640x480
 static constexpr int CAM_JPEG_QUALITY = 15;                 // 0 best quality, 63 worst
 static constexpr int CAM_FB_COUNT = 2;
 
-// Manual exposure/gain for IR-pass stability (tune)
-static constexpr int CAM_AEC_VALUE = 2500; // try 200, 400, 800, 1200
-static constexpr int CAM_AGC_GAIN  = 30;   // try 0..30
+// Manual exposure/gain for IR-pass stability
+static constexpr int CAM_AEC_VALUE = 2500;
+static constexpr int CAM_AGC_GAIN  = 30;   
 
 static const uint8_t RECV_MAC[6] = { 0x7C,0xDF,0xA1,0xFB,0x71,0x30 };
