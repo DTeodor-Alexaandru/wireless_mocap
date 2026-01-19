@@ -218,13 +218,8 @@ As a rule:
 
 ## 4. Demo video
 
-**Demo link:** TODO (add your filmed demo URL here)
+![alt text](img/demo.mp4)
 
-Suggested demo content:
-1. Physical setup and baseline measurement.
-2. Camera node stream (optional) showing IR marker visibility.
-3. Receiver Serial output showing `X,Y,Z` while moving the marker.
-4. Short note on detection FPS and stability.
 
 ---
 
