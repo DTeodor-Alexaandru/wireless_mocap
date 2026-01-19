@@ -218,11 +218,10 @@ As a rule:
 
 ## 4. Demo video
 
-<video controls width="720">
-  <source src="img/demo.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+![alt text](img/demo.gif)
 
+
+https://youtube.com/shorts/f8xSuO7XCUY?feature=share
 
 ---
 
