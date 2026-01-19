@@ -218,7 +218,10 @@ As a rule:
 
 ## 4. Demo video
 
-![alt text](img/demo.mp4)
+<video controls width="720">
+  <source src="img/demo.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
 
 
 ---
