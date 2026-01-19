@@ -1,0 +1,636 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include "esp_camera.h"
+#include "esp_http_server.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <atomic>
+
+// JPEG -> RGB565 decode
+#include "img_converters.h"  // jpg2rgb565(), jpg_scale_t
+
+// ===================== WiFi =====================
+static const char* WIFI_SSID = "UPB-Guest";
+static const char* WIFI_PASS = "";
+
+// ===================== Camera pins (Adafruit OV5640 breakout -> ESP32-S3) =====================
+// Assumes OV5640 breakout XCLK jumper is set to INT (internal clock), so pin_xclk = -1.
+#define CAM_PIN_PWDN   15
+#define CAM_PIN_RESET  -1
+
+#define CAM_PIN_SIOD   4   // SDA
+#define CAM_PIN_SIOC   5   // SCL
+
+#define CAM_PIN_VSYNC  6   // VS
+#define CAM_PIN_HREF   7   // HS
+#define CAM_PIN_PCLK   13  // PC
+#define CAM_PIN_XCLK   -1  // XC not used (internal clock)
+
+#define CAM_PIN_D0     11  // D2 (Y2)
+#define CAM_PIN_D1     9   // D3 (Y3)
+#define CAM_PIN_D2     8   // D4 (Y4)
+#define CAM_PIN_D3     10  // D5 (Y5)
+#define CAM_PIN_D4     12  // D6 (Y6)
+#define CAM_PIN_D5     18  // D7 (Y7)
+#define CAM_PIN_D6     17  // D8 (Y8)
+#define CAM_PIN_D7     16  // D9 (Y9)
+
+// ===================== Stream / buffer =====================
+static httpd_handle_t web_server = nullptr;
+
+static SemaphoreHandle_t frame_mutex = nullptr;
+static uint8_t* latest_jpeg = nullptr;
+static size_t latest_len = 0;
+static size_t latest_cap = 0;
+
+static std::atomic<uint32_t> capture_count{0};
+
+// MJPEG framing
+static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+static const char* STREAM_BOUNDARY     = "\r\n--frame\r\n";
+static const char* STREAM_PART_HEADER  = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+// ===================== Web UI =====================
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32-S3 OV5640</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 1.5rem; }
+    img  { max-width: 100%; height: auto; border: 1px solid #ccc; }
+    code { background: #f5f5f5; padding: 0.2rem 0.35rem; }
+  </style>
+</head>
+<body>
+  <h1>ESP32-S3 OV5640 (VGA Stream)</h1>
+  <p>MJPEG: <code>/stream</code> | Single JPEG: <code>/jpg</code></p>
+  <img src="/stream" />
+</body>
+</html>
+)HTML";
+
+// ===================== Helpers =====================
+static bool ensure_frame_capacity(size_t needed) {
+  if (needed <= latest_cap) return true;
+
+  size_t new_cap = needed + (needed / 2) + 2048;
+
+  uint8_t* new_buf = (uint8_t*)heap_caps_malloc(new_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!new_buf) new_buf = (uint8_t*)heap_caps_malloc(new_cap, MALLOC_CAP_8BIT);
+  if (!new_buf) return false;
+
+  if (latest_jpeg) free(latest_jpeg);
+  latest_jpeg = new_buf;
+  latest_cap  = new_cap;
+  latest_len  = 0;
+  return true;
+}
+
+// ===================== Capture task (runs as fast as possible) =====================
+static void capture_task(void* pv) {
+  (void)pv;
+
+  for (;;) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+
+    if (fb->format == PIXFORMAT_JPEG && fb->len > 0) {
+      if (xSemaphoreTake(frame_mutex, portMAX_DELAY) == pdTRUE) {
+        if (ensure_frame_capacity(fb->len)) {
+          memcpy(latest_jpeg, fb->buf, fb->len);
+          latest_len = fb->len;
+        } else {
+          latest_len = 0;
+        }
+        xSemaphoreGive(frame_mutex);
+      }
+      capture_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    esp_camera_fb_return(fb);
+    taskYIELD();
+  }
+}
+
+// ===================== IR marker detection (blob / connected components) =====================
+//
+// We decode JPEG -> RGB565 at 2x downscale for speed:
+// VGA 640x480 -> 320x240 detection buffer.
+// We then threshold on luminance (not-black) and find connected bright blobs.
+// Finally we print blob centroids in VGA coordinates.
+//
+// Tune these:
+static constexpr uint8_t LUMA_THR   = 20;   // 50..140 typical; raise to ignore noise
+static constexpr int     MIN_AREA   = 2;   // reject tiny noise; lower if markers are small/far
+static constexpr int     MAX_AREA   = 6000; // reject huge bright regions (glare)
+static constexpr int     MAX_BLOBS  = 10;
+
+// Source resolution (VGA)
+static constexpr int SRC_W = 640;
+static constexpr int SRC_H = 480;
+
+// Decode scale for detection
+static constexpr jpg_scale_t DETECT_SCALE = JPG_SCALE_2X;
+static constexpr int SCALE_DIV = 2;
+
+static constexpr int DET_W = SRC_W / SCALE_DIV; // 320
+static constexpr int DET_H = SRC_H / SCALE_DIV; // 240
+
+struct Blob {
+  uint32_t sumx = 0;
+  uint32_t sumy = 0;
+  uint32_t area = 0;
+};
+
+// Buffers for detection
+static uint8_t*  jpeg_copy = nullptr;
+static size_t    jpeg_copy_cap = 0;
+
+static uint16_t* rgb565_buf = nullptr;     // DET_W*DET_H pixels
+static size_t    rgb565_cap_bytes = 0;
+
+static uint8_t*  bin_mask = nullptr;       // DET_W*DET_H (0/1)
+static uint8_t*  visited  = nullptr;       // DET_W*DET_H (0/1)
+
+// BFS queue
+static int* qx = nullptr;
+static int* qy = nullptr;
+static int  qcap = 0;
+
+static bool ensure_jpeg_copy_capacity(size_t needed) {
+  if (needed <= jpeg_copy_cap) return true;
+  size_t new_cap = needed + (needed / 2) + 1024;
+
+  uint8_t* nb = (uint8_t*)heap_caps_malloc(new_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!nb) nb = (uint8_t*)heap_caps_malloc(new_cap, MALLOC_CAP_8BIT);
+  if (!nb) return false;
+
+  if (jpeg_copy) free(jpeg_copy);
+  jpeg_copy = nb;
+  jpeg_copy_cap = new_cap;
+  return true;
+}
+
+static bool ensure_rgb565_capacity() {
+  const size_t need = (size_t)DET_W * (size_t)DET_H * 2;
+  if (rgb565_buf && need <= rgb565_cap_bytes) return true;
+
+  uint16_t* nb = (uint16_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!nb) nb = (uint16_t*)heap_caps_malloc(need, MALLOC_CAP_8BIT);
+  if (!nb) return false;
+
+  if (rgb565_buf) free(rgb565_buf);
+  rgb565_buf = nb;
+  rgb565_cap_bytes = need;
+  return true;
+}
+
+static bool ensure_masks() {
+  const size_t need = (size_t)DET_W * (size_t)DET_H;
+  if (!bin_mask) {
+    bin_mask = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!bin_mask) bin_mask = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_8BIT);
+    if (!bin_mask) return false;
+  }
+  if (!visited) {
+    visited = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!visited) visited = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_8BIT);
+    if (!visited) return false;
+  }
+  return true;
+}
+
+static bool ensure_queue(int desired) {
+  if (qx && qy && qcap == desired) return true;
+
+  if (qx) free(qx);
+  if (qy) free(qy);
+
+  qx = (int*)heap_caps_malloc(desired * sizeof(int), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  qy = (int*)heap_caps_malloc(desired * sizeof(int), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!qx || !qy) {
+    if (qx) free(qx);
+    if (qy) free(qy);
+    qx = qy = nullptr;
+    qcap = 0;
+    return false;
+  }
+  qcap = desired;
+  return true;
+}
+
+static inline uint8_t rgb565_luma(uint16_t p) {
+  uint8_t r = ((p >> 11) & 0x1F) << 3;
+  uint8_t g = ((p >> 5)  & 0x3F) << 2;
+  uint8_t b = ( p        & 0x1F) << 3;
+  return (uint8_t)((77 * r + 150 * g + 29 * b) >> 8);
+}
+
+static void find_ir_blobs_and_print(const uint16_t* img) {
+  if (!ensure_masks()) {
+    Serial.println("IR: mask alloc failed");
+    return;
+  }
+
+  // Queue capacity: should comfortably cover typical blob sizes
+  // If you expect very large bright areas, increase this.
+  if (!ensure_queue(20000)) {
+    Serial.println("IR: queue alloc failed");
+    return;
+  }
+
+  const int W = DET_W;
+  const int H = DET_H;
+  const int N = W * H;
+
+  // Build binary mask & clear visited
+  for (int i = 0; i < N; i++) {
+    uint8_t lum = rgb565_luma(img[i]);
+    bin_mask[i] = (lum >= LUMA_THR) ? 1 : 0;
+    visited[i]  = 0;
+  }
+
+  Blob blobs[MAX_BLOBS];
+  int blob_count = 0;
+
+  auto consider_blob = [&](const Blob& b) {
+    if (b.area < (uint32_t)MIN_AREA || b.area > (uint32_t)MAX_AREA) return;
+    if (blob_count < MAX_BLOBS) blobs[blob_count++] = b;
+  };
+
+  // BFS flood-fill (4-connected)
+  for (int y0 = 0; y0 < H; y0++) {
+    for (int x0 = 0; x0 < W; x0++) {
+      int idx0 = y0 * W + x0;
+      if (!bin_mask[idx0] || visited[idx0]) continue;
+
+      Blob b;
+      int qh = 0, qt = 0;
+
+      visited[idx0] = 1;
+      qx[qt] = x0;
+      qy[qt] = y0;
+      qt++;
+
+      while (qh < qt) {
+        int x = qx[qh];
+        int y = qy[qh];
+        qh++;
+
+        b.sumx += (uint32_t)x;
+        b.sumy += (uint32_t)y;
+        b.area++;
+
+        if (b.area > (uint32_t)MAX_AREA) break;
+        if (qt + 4 >= qcap) break; // avoid overflow
+
+        // left
+        if (x > 0) {
+          int idx = y * W + (x - 1);
+          if (bin_mask[idx] && !visited[idx]) {
+            visited[idx] = 1;
+            qx[qt] = x - 1;
+            qy[qt] = y;
+            qt++;
+          }
+        }
+        // right
+        if (x + 1 < W) {
+          int idx = y * W + (x + 1);
+          if (bin_mask[idx] && !visited[idx]) {
+            visited[idx] = 1;
+            qx[qt] = x + 1;
+            qy[qt] = y;
+            qt++;
+          }
+        }
+        // up
+        if (y > 0) {
+          int idx = (y - 1) * W + x;
+          if (bin_mask[idx] && !visited[idx]) {
+            visited[idx] = 1;
+            qx[qt] = x;
+            qy[qt] = y - 1;
+            qt++;
+          }
+        }
+        // down
+        if (y + 1 < H) {
+          int idx = (y + 1) * W + x;
+          if (bin_mask[idx] && !visited[idx]) {
+            visited[idx] = 1;
+            qx[qt] = x;
+            qy[qt] = y + 1;
+            qt++;
+          }
+        }
+      }
+
+      if (b.area <= (uint32_t)MAX_AREA) consider_blob(b);
+    }
+  }
+
+  if (blob_count == 0) {
+    Serial.println("IR blobs: none");
+    return;
+  }
+
+  Serial.print("IR blobs: ");
+  for (int i = 0; i < blob_count; i++) {
+    int cx = (int)(blobs[i].sumx / blobs[i].area);
+    int cy = (int)(blobs[i].sumy / blobs[i].area);
+
+    // scale back to VGA coordinates
+    int x_vga = cx * SCALE_DIV;
+    int y_vga = cy * SCALE_DIV;
+
+    Serial.printf("(%d,%d)[%u] ", x_vga, y_vga, (unsigned)blobs[i].area);
+  }
+  Serial.println();
+}
+
+static void detect_task(void* pv) {
+  (void)pv;
+
+  if (!ensure_rgb565_capacity()) {
+    Serial.println("detect_task: failed to allocate RGB565 buffer");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  for (;;) {
+    // Copy latest JPEG under mutex
+    size_t len = 0;
+    if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      len = latest_len;
+      if (len && latest_jpeg) {
+        if (ensure_jpeg_copy_capacity(len)) {
+          memcpy(jpeg_copy, latest_jpeg, len);
+        } else {
+          len = 0;
+        }
+      } else {
+        len = 0;
+      }
+      xSemaphoreGive(frame_mutex);
+    }
+
+    if (len == 0) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    // Decode JPEG -> RGB565 (downscaled 2x)
+    bool ok = jpg2rgb565(jpeg_copy, len, (uint8_t*)rgb565_buf, DETECT_SCALE);
+    if (ok) {
+      find_ir_blobs_and_print(rgb565_buf);
+    } else {
+      Serial.println("IR: decode failed");
+    }
+
+    // Control detection rate (adjust as needed)
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ===================== HTTP handlers =====================
+static esp_err_t index_handler(httpd_req_t* req) {
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t jpg_handler(httpd_req_t* req) {
+  if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Mutex timeout");
+    return ESP_FAIL;
+  }
+
+  if (latest_len == 0 || !latest_jpeg) {
+    xSemaphoreGive(frame_mutex);
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "No frame yet", HTTPD_RESP_USE_STRLEN);
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  esp_err_t res = httpd_resp_send(req, (const char*)latest_jpeg, latest_len);
+  xSemaphoreGive(frame_mutex);
+  return res;
+}
+
+static esp_err_t stream_handler(httpd_req_t* req) {
+  httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  uint8_t* local = nullptr;
+  size_t local_cap = 0;
+
+  while (true) {
+    size_t len = 0;
+
+    if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+      continue;
+    }
+
+    len = latest_len;
+    if (len == 0 || !latest_jpeg) {
+      xSemaphoreGive(frame_mutex);
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
+    if (len > local_cap) {
+      uint8_t* new_local = (uint8_t*)realloc(local, len);
+      if (!new_local) {
+        xSemaphoreGive(frame_mutex);
+        free(local);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Stream realloc failed");
+        return ESP_FAIL;
+      }
+      local = new_local;
+      local_cap = len;
+    }
+
+    memcpy(local, latest_jpeg, len);
+    xSemaphoreGive(frame_mutex);
+
+    esp_err_t res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+    if (res != ESP_OK) break;
+
+    char header[128];
+    int hlen = snprintf(header, sizeof(header), STREAM_PART_HEADER, (unsigned)len);
+    res = httpd_resp_send_chunk(req, header, hlen);
+    if (res != ESP_OK) break;
+
+    res = httpd_resp_send_chunk(req, (const char*)local, len);
+    if (res != ESP_OK) break;
+
+    taskYIELD();
+  }
+
+  free(local);
+  httpd_resp_send_chunk(req, nullptr, 0);
+  return ESP_OK;
+}
+
+static void start_webserver() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+
+  if (httpd_start(&web_server, &config) == ESP_OK) {
+    httpd_uri_t uri_index  = { .uri = "/",       .method = HTTP_GET, .handler = index_handler,  .user_ctx = nullptr };
+    httpd_uri_t uri_stream = { .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = nullptr };
+    httpd_uri_t uri_jpg    = { .uri = "/jpg",    .method = HTTP_GET, .handler = jpg_handler,    .user_ctx = nullptr };
+
+    httpd_register_uri_handler(web_server, &uri_index);
+    httpd_register_uri_handler(web_server, &uri_stream);
+    httpd_register_uri_handler(web_server, &uri_jpg);
+  }
+}
+
+// ===================== Setup =====================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  frame_mutex = xSemaphoreCreateMutex();
+  if (!frame_mutex) {
+    Serial.println("Failed to create mutex");
+    while (true) delay(1000);
+  }
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Camera config: VGA JPEG
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+
+  cfg.pin_d0 = CAM_PIN_D0;
+  cfg.pin_d1 = CAM_PIN_D1;
+  cfg.pin_d2 = CAM_PIN_D2;
+  cfg.pin_d3 = CAM_PIN_D3;
+  cfg.pin_d4 = CAM_PIN_D4;
+  cfg.pin_d5 = CAM_PIN_D5;
+  cfg.pin_d6 = CAM_PIN_D6;
+  cfg.pin_d7 = CAM_PIN_D7;
+
+  cfg.pin_xclk  = CAM_PIN_XCLK;
+  cfg.pin_pclk  = CAM_PIN_PCLK;
+  cfg.pin_vsync = CAM_PIN_VSYNC;
+  cfg.pin_href  = CAM_PIN_HREF;
+
+  cfg.pin_sccb_sda = CAM_PIN_SIOD;
+  cfg.pin_sccb_scl = CAM_PIN_SIOC;
+
+  cfg.pin_pwdn  = CAM_PIN_PWDN;
+  cfg.pin_reset = CAM_PIN_RESET;
+
+  cfg.xclk_freq_hz = 20000000; // unused when pin_xclk = -1
+
+  cfg.pixel_format = PIXFORMAT_JPEG;
+
+  // Switch to VGA (640x480)
+  cfg.frame_size   = FRAMESIZE_VGA;
+
+  // High compression / low quality for speed
+  cfg.jpeg_quality = 0; // try 45..63 (63 = max compression)
+
+  cfg.fb_count     = 2;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+  cfg.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) {
+    Serial.printf("esp_camera_init failed: 0x%x\n", err);
+    Serial.println("Check wiring and that the OV5640 clock jumper is set to INT.");
+    while (true) delay(1000);
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_quality(s, 0);
+
+    s->set_gain_ctrl(s, 0);
+    s->set_exposure_ctrl(s, 0);
+
+
+    // These values are the knobs you will tune:
+    // - aec_value: lower = shorter exposure (darker, less noise, higher FPS consistency)
+    // - agc_gain: higher = brighter but more noise
+    s->set_aec_value(s, 400);        // try: 5..80
+    s->set_agc_gain(s, 0);          // try: 0..30 (start at 0)
+
+    // Reduce processing variability
+    s->set_awb_gain(s, 0);
+    s->set_wb_mode(s, 0);
+    s->set_special_effect(s, 0);
+
+    // Optional: reduce fixed-pattern artifacts on “black”
+    s->set_denoise(s, 0);  
+  }
+
+  // Start capture task (core 1)
+  xTaskCreatePinnedToCore(
+    capture_task,
+    "capture_task",
+    8192,
+    nullptr,
+    3,
+    nullptr,
+    1
+  );
+
+  // Start detection task (core 0)
+  xTaskCreatePinnedToCore(
+    detect_task,
+    "detect_task",
+    16384,
+    nullptr,
+    2,
+    nullptr,
+    0
+  );
+
+  start_webserver();
+  Serial.println("Open http://<IP>/  (stream: /stream, single jpg: /jpg)");
+}
+
+// ===================== Loop: print capture FPS =====================
+void loop() {
+  static uint32_t last_count = 0;
+  static uint32_t last_ms = 0;
+
+  uint32_t now = millis();
+  if (last_ms == 0) last_ms = now;
+
+  if (now - last_ms >= 1000) {
+    uint32_t cnt = capture_count.load(std::memory_order_relaxed);
+    uint32_t fps = cnt - last_count;
+    last_count = cnt;
+    last_ms = now;
+
+    Serial.print("Capture FPS (ESP32): ");
+    Serial.println(fps);
+  }
+
+  delay(10);
+}

@@ -1,0 +1,98 @@
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <atomic>
+
+// Pins (your working map, XCLK internal on breakout)
+#define CAM_PIN_PWDN   15
+#define CAM_PIN_RESET  -1
+#define CAM_PIN_SIOD   4
+#define CAM_PIN_SIOC   5
+#define CAM_PIN_VSYNC  6
+#define CAM_PIN_HREF   7
+#define CAM_PIN_PCLK   13
+#define CAM_PIN_XCLK   -1
+#define CAM_PIN_D0     11
+#define CAM_PIN_D1     9
+#define CAM_PIN_D2     8
+#define CAM_PIN_D3     10
+#define CAM_PIN_D4     12
+#define CAM_PIN_D5     18
+#define CAM_PIN_D6     17
+#define CAM_PIN_D7     16
+
+static std::atomic<uint32_t> capture_count{0};
+
+void setup() {
+  Serial.begin(921600);
+  delay(300);
+
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+
+  cfg.pin_d0 = CAM_PIN_D0; cfg.pin_d1 = CAM_PIN_D1; cfg.pin_d2 = CAM_PIN_D2; cfg.pin_d3 = CAM_PIN_D3;
+  cfg.pin_d4 = CAM_PIN_D4; cfg.pin_d5 = CAM_PIN_D5; cfg.pin_d6 = CAM_PIN_D6; cfg.pin_d7 = CAM_PIN_D7;
+
+  cfg.pin_xclk  = CAM_PIN_XCLK;
+  cfg.pin_pclk  = CAM_PIN_PCLK;
+  cfg.pin_vsync = CAM_PIN_VSYNC;
+  cfg.pin_href  = CAM_PIN_HREF;
+
+  cfg.pin_sccb_sda = CAM_PIN_SIOD;
+  cfg.pin_sccb_scl = CAM_PIN_SIOC;
+
+  cfg.pin_pwdn  = CAM_PIN_PWDN;
+  cfg.pin_reset = CAM_PIN_RESET;
+
+  cfg.xclk_freq_hz = 20000000;            // unused when pin_xclk=-1, but harmless
+  cfg.pixel_format = PIXFORMAT_JPEG; // uncompressed 8-bit
+  cfg.frame_size   = FRAMESIZE_QVGA;      // 320x240
+  cfg.fb_count     = 2;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+  cfg.jpeg_quality = 63;
+
+  // For raw formats, DRAM often outperforms PSRAM for sustained throughput
+  cfg.fb_location  = CAMERA_FB_IN_DRAM;
+
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) {
+    Serial.printf("esp_camera_init failed: 0x%x\n", err);
+    while (true) delay(1000);
+  }
+
+  // Force short exposure to prevent low-light “slow FPS”
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_pixformat(s, PIXFORMAT_JPEG);
+    s->set_quality(s, 63);
+
+    s->set_exposure_ctrl(s, 0);  // disable auto exposure
+    s->set_gain_ctrl(s, 0);      // disable auto gain
+    s->set_aec_value(s, 20);     // try 10..100 (lower = shorter exposure)
+    s->set_agc_gain(s, 0);
+  }
+
+  Serial.println("Capturing GRAYSCALE QVGA as fast as possible...");
+}
+
+void loop() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (fb) {
+    capture_count.fetch_add(1, std::memory_order_relaxed);
+    esp_camera_fb_return(fb);
+  } else {
+    delay(1);
+  }
+
+  static uint32_t last_ms = 0, last_cnt = 0;
+  uint32_t now = millis();
+  if (last_ms == 0) last_ms = now;
+
+  if (now - last_ms >= 1000) {
+    uint32_t cnt = capture_count.load(std::memory_order_relaxed);
+    Serial.printf("Capture FPS: %u\n", cnt - last_cnt);
+    last_cnt = cnt;
+    last_ms = now;
+  }
+}

@@ -1,0 +1,476 @@
+#include <Arduino.h>
+#include <WiFi.h> // not used, but harmless if in your project
+#include "esp_camera.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <atomic>
+
+#include "img_converters.h"  // jpg2rgb565(), jpg_scale_t
+
+// ===================== Camera pins (Adafruit OV5640 breakout -> ESP32-S3) =====================
+// Assumes OV5640 breakout XCLK jumper is set to INT (internal clock), so pin_xclk = -1.
+#define CAM_PIN_PWDN   15
+#define CAM_PIN_RESET  -1
+
+#define CAM_PIN_SIOD   4
+#define CAM_PIN_SIOC   5
+
+#define CAM_PIN_VSYNC  6
+#define CAM_PIN_HREF   7
+#define CAM_PIN_PCLK   13
+#define CAM_PIN_XCLK   -1
+
+#define CAM_PIN_D0     11
+#define CAM_PIN_D1     9
+#define CAM_PIN_D2     8
+#define CAM_PIN_D3     10
+#define CAM_PIN_D4     12
+#define CAM_PIN_D5     18
+#define CAM_PIN_D6     17
+#define CAM_PIN_D7     16
+
+// ===================== Capture settings =====================
+// JPEG quality: 0 best quality (largest), 63 worst (smallest).
+// For tiny markers, do NOT go too high compression; start 10..20.
+static constexpr int JPEG_QUALITY = 15;
+static constexpr framesize_t CAM_FRAME = FRAMESIZE_QVGA; // 640x480
+static constexpr int FB_COUNT = 2;
+
+// ===================== Detection settings =====================
+// Decode VGA JPEG at 2x downscale => QVGA detection buffer
+
+
+static constexpr int SRC_W = 320;
+static constexpr int SRC_H = 240;
+
+static constexpr jpg_scale_t DET_SCALE = JPG_SCALE_4X; // VGA -> 160x120
+static constexpr int SCALE_DIV = 4;
+
+static constexpr int DET_W = SRC_W / SCALE_DIV; // 160
+static constexpr int DET_H = SRC_H / SCALE_DIV; // 120
+
+
+// Luma threshold: raise to reject noise/hot pixels, lower to detect dim markers.
+static constexpr uint8_t LUMA_THR = 200;  // start high for IR dots; try 160..230
+
+// Blob filters
+static constexpr uint32_t MIN_AREA = 2;      // small markers
+static constexpr uint32_t MAX_AREA = 2000;   // reject glare / large blobs
+static constexpr int MAX_PRINT = 10;
+
+// RLE-CCL limits (protect against noisy frames)
+static constexpr int MAX_RUNS_PER_ROW = 250;
+static constexpr int MAX_COMPONENTS   = 200;
+
+// ===================== Shared latest JPEG buffer =====================
+static SemaphoreHandle_t g_frame_mutex = nullptr;
+static uint8_t* g_latest_jpeg = nullptr;
+static size_t   g_latest_len  = 0;
+static size_t   g_latest_cap  = 0;
+
+static std::atomic<uint32_t> g_capture_count{0};
+static std::atomic<uint32_t> g_detect_count{0};
+
+// Last detection line (for debug / later ESP-NOW)
+static char g_last_line[256] = "IR blobs: none";
+
+// Prefer PSRAM if available
+static void* caps_malloc(size_t n) {
+  void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = heap_caps_malloc(n, MALLOC_CAP_8BIT);
+  return p;
+}
+
+static bool ensure_latest_capacity(size_t needed) {
+  if (needed <= g_latest_cap) return true;
+
+  size_t new_cap = needed + (needed / 2) + 2048;
+  uint8_t* nb = (uint8_t*)caps_malloc(new_cap);
+  if (!nb) return false;
+
+  if (g_latest_jpeg) free(g_latest_jpeg);
+  g_latest_jpeg = nb;
+  g_latest_cap  = new_cap;
+  g_latest_len  = 0;
+  return true;
+}
+
+static void camera_power_cycle() {
+  pinMode(CAM_PIN_PWDN, OUTPUT);
+  digitalWrite(CAM_PIN_PWDN, 1);
+  delay(50);
+  digitalWrite(CAM_PIN_PWDN, 0);
+  delay(50);
+}
+
+// ===================== Capture task: keep camera running at max FPS =====================
+static void capture_task(void* pv) {
+  (void)pv;
+  for (;;) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    if (fb->format == PIXFORMAT_JPEG && fb->len > 0) {
+      if (xSemaphoreTake(g_frame_mutex, portMAX_DELAY) == pdTRUE) {
+        if (ensure_latest_capacity(fb->len)) {
+          memcpy(g_latest_jpeg, fb->buf, fb->len);
+          g_latest_len = fb->len;
+        } else {
+          g_latest_len = 0;
+        }
+        xSemaphoreGive(g_frame_mutex);
+      }
+      g_capture_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    esp_camera_fb_return(fb);
+
+    // Let other tasks run; keep capture tight
+    taskYIELD();
+  }
+}
+
+// ===================== Detection: JPEG decode -> RGB565 -> luma -> RLE-CCL =====================
+struct Run { int x0, x1; int label; }; // [x0, x1)
+struct Comp {
+  int parent;
+  uint32_t area;
+  uint32_t sumx;
+  uint32_t sumy;
+  bool used;
+};
+
+static inline int find_root(Comp* c, int a) {
+  while (c[a].parent != a) {
+    c[a].parent = c[c[a].parent].parent;
+    a = c[a].parent;
+  }
+  return a;
+}
+
+static inline void unite(Comp* c, int a, int b) {
+  int ra = find_root(c, a);
+  int rb = find_root(c, b);
+  if (ra == rb) return;
+
+  if (c[ra].area < c[rb].area) { int t = ra; ra = rb; rb = t; }
+  c[rb].parent = ra;
+  c[ra].area += c[rb].area;
+  c[ra].sumx += c[rb].sumx;
+  c[ra].sumy += c[rb].sumy;
+  c[rb].used = false;
+}
+
+static inline uint32_t sum_range(int x0, int x1) {
+  uint32_t len = (uint32_t)(x1 - x0);
+  return (uint32_t)(x0 + (x1 - 1)) * len / 2;
+}
+
+// RGB565 -> luma (fast integer approximation)
+static inline uint8_t rgb565_luma(uint16_t p) {
+  uint8_t r = ((p >> 11) & 0x1F) << 3;
+  uint8_t g = ((p >> 5)  & 0x3F) << 2;
+  uint8_t b = ( p        & 0x1F) << 3;
+  return (uint8_t)((77 * r + 150 * g + 29 * b) >> 8);
+}
+
+static uint16_t* g_rgb565 = nullptr; // DET_W*DET_H
+static size_t    g_rgb565_bytes = 0;
+
+static bool ensure_rgb565_buf() {
+  const size_t need = (size_t)DET_W * (size_t)DET_H * 2;
+  if (g_rgb565 && need <= g_rgb565_bytes) return true;
+
+  uint16_t* nb = (uint16_t*)caps_malloc(need);
+  if (!nb) return false;
+
+  if (g_rgb565) free(g_rgb565);
+  g_rgb565 = nb;
+  g_rgb565_bytes = need;
+  return true;
+}
+
+static void detect_on_rgb565_qvga(const uint16_t* img) {
+  Run prev_runs[MAX_RUNS_PER_ROW];
+  Run curr_runs[MAX_RUNS_PER_ROW];
+  int prev_n = 0;
+
+  Comp comps[MAX_COMPONENTS];
+  int comp_n = 0;
+
+  auto new_comp = [&]() -> int {
+    if (comp_n >= MAX_COMPONENTS) return -1;
+    comps[comp_n] = { comp_n, 0, 0, 0, true };
+    return comp_n++;
+  };
+
+  for (int y = 0; y < DET_H; y++) {
+    const uint16_t* row = img + (y * DET_W);
+    int curr_n = 0;
+
+    int x = 0;
+    while (x < DET_W) {
+      while (x < DET_W && rgb565_luma(row[x]) < LUMA_THR) x++;
+      if (x >= DET_W) break;
+
+      int x0 = x;
+      while (x < DET_W && rgb565_luma(row[x]) >= LUMA_THR) x++;
+      int x1 = x;
+
+      if (curr_n >= MAX_RUNS_PER_ROW) {
+        strncpy(g_last_line, "IR blobs: too many runs (noise)", sizeof(g_last_line) - 1);
+        g_last_line[sizeof(g_last_line) - 1] = 0;
+        return;
+      }
+      curr_runs[curr_n++] = { x0, x1, -1 };
+    }
+
+    int pi = 0;
+    for (int ci = 0; ci < curr_n; ci++) {
+      Run& cr = curr_runs[ci];
+
+      while (pi < prev_n && prev_runs[pi].x1 <= cr.x0) pi++;
+
+      int label = -1;
+      int pj = pi;
+      while (pj < prev_n && prev_runs[pj].x0 < cr.x1) {
+        int pl = prev_runs[pj].label;
+        if (pl >= 0) {
+          if (label < 0) label = pl;
+          else unite(comps, label, pl);
+        }
+        pj++;
+      }
+
+      if (label < 0) {
+        label = new_comp();
+        if (label < 0) {
+          strncpy(g_last_line, "IR blobs: too many components", sizeof(g_last_line) - 1);
+          g_last_line[sizeof(g_last_line) - 1] = 0;
+          return;
+        }
+      }
+
+      label = find_root(comps, label);
+      cr.label = label;
+
+      uint32_t len = (uint32_t)(cr.x1 - cr.x0);
+      comps[label].area += len;
+      comps[label].sumx += sum_range(cr.x0, cr.x1);
+      comps[label].sumy += (uint32_t)y * len;
+    }
+
+    for (int ci = 0; ci < curr_n; ci++) {
+      curr_runs[ci].label = find_root(comps, curr_runs[ci].label);
+    }
+
+    prev_n = curr_n;
+    for (int i = 0; i < curr_n; i++) prev_runs[i] = curr_runs[i];
+  }
+
+  // Build output line in VGA coordinates
+  int printed = 0;
+  int off = 0;
+  off += snprintf(g_last_line + off, sizeof(g_last_line) - off, "IR blobs: ");
+
+  for (int i = 0; i < comp_n && printed < MAX_PRINT; i++) {
+    if (!comps[i].used) continue;
+    if (comps[i].parent != i) continue; // root only
+    if (comps[i].area < MIN_AREA || comps[i].area > MAX_AREA) continue;
+
+    int cx = (int)(comps[i].sumx / comps[i].area);
+    int cy = (int)(comps[i].sumy / comps[i].area);
+
+    // scale back to VGA
+    int x_vga = cx * SCALE_DIV;
+    int y_vga = cy * SCALE_DIV;
+
+    off += snprintf(g_last_line + off, sizeof(g_last_line) - off,
+                    "(%d,%d)[%u] ", x_vga, y_vga, (unsigned)comps[i].area);
+    printed++;
+    if (off >= (int)sizeof(g_last_line)) break;
+  }
+
+  if (printed == 0) {
+    strncpy(g_last_line, "IR blobs: none", sizeof(g_last_line) - 1);
+    g_last_line[sizeof(g_last_line) - 1] = 0;
+  }
+}
+
+static void detect_task(void* pv) {
+  (void)pv;
+
+  if (!ensure_rgb565_buf()) {
+    Serial.println("detect_task: RGB565 alloc failed");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  uint8_t* local_jpg = nullptr;
+  size_t local_cap = 0;
+
+  uint32_t iter = 0;
+
+  for (;;) {
+    size_t len = 0;
+
+    // Copy latest JPEG under mutex
+    if (xSemaphoreTake(g_frame_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      len = g_latest_len;
+      if (len && g_latest_jpeg) {
+        if (len > local_cap) {
+          size_t new_cap = len + (len / 2) + 1024;
+          uint8_t* nb = (uint8_t*)caps_malloc(new_cap);
+          if (nb) {
+            if (local_jpg) free(local_jpg);
+            local_jpg = nb;
+            local_cap = new_cap;
+          } else {
+            len = 0;
+          }
+        }
+        if (len && local_jpg) memcpy(local_jpg, g_latest_jpeg, len);
+      } else {
+        len = 0;
+      }
+      xSemaphoreGive(g_frame_mutex);
+    }
+
+    if (len == 0 || !local_jpg) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+
+    // Decode JPEG -> RGB565 at DET_SCALE (recommend 4X for speed)
+    bool ok = jpg2rgb565(local_jpg, len, (uint8_t*)g_rgb565, DET_SCALE);
+    if (ok) {
+      detect_on_rgb565_qvga(g_rgb565); // rename is fine; it uses DET_W/DET_H
+      g_detect_count.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      strncpy(g_last_line, "IR blobs: decode failed", sizeof(g_last_line) - 1);
+      g_last_line[sizeof(g_last_line) - 1] = 0;
+    }
+
+    // WDT-safe yielding: let IDLE task run
+    iter++;
+    if ((iter & 0x0F) == 0) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    } else {
+      taskYIELD();
+    }
+  }
+}
+
+
+// ===================== Setup =====================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println("\n=== JPEG Detection (VGA capture, QVGA detect) ===");
+  Serial.printf("psramFound(): %s\n", psramFound() ? "YES" : "NO");
+
+  g_frame_mutex = xSemaphoreCreateMutex();
+  if (!g_frame_mutex) {
+    Serial.println("Mutex alloc failed");
+    while (true) delay(1000);
+  }
+
+  camera_power_cycle();
+
+  camera_config_t cfg = {};
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+
+  cfg.pin_d0 = CAM_PIN_D0; cfg.pin_d1 = CAM_PIN_D1; cfg.pin_d2 = CAM_PIN_D2; cfg.pin_d3 = CAM_PIN_D3;
+  cfg.pin_d4 = CAM_PIN_D4; cfg.pin_d5 = CAM_PIN_D5; cfg.pin_d6 = CAM_PIN_D6; cfg.pin_d7 = CAM_PIN_D7;
+
+  cfg.pin_xclk  = CAM_PIN_XCLK;
+  cfg.pin_pclk  = CAM_PIN_PCLK;
+  cfg.pin_vsync = CAM_PIN_VSYNC;
+  cfg.pin_href  = CAM_PIN_HREF;
+
+  cfg.pin_sccb_sda = CAM_PIN_SIOD;
+  cfg.pin_sccb_scl = CAM_PIN_SIOC;
+
+  cfg.pin_pwdn  = CAM_PIN_PWDN;
+  cfg.pin_reset = CAM_PIN_RESET;
+
+  cfg.xclk_freq_hz = 20000000; // unused when pin_xclk = -1
+
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = CAM_FRAME;
+  cfg.jpeg_quality = JPEG_QUALITY;
+  cfg.fb_count     = FB_COUNT;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+  cfg.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+
+  Serial.println("Initializing camera...");
+  esp_err_t err = esp_camera_init(&cfg);
+  Serial.printf("esp_camera_init: 0x%X\n", (unsigned)err);
+  if (err != ESP_OK) {
+    Serial.println("Camera init failed. Check wiring / clock jumper.");
+    while (true) delay(1000);
+  }
+
+  // IR-pass stability: avoid AEC/AGC railed behavior in darkness.
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, CAM_FRAME);
+    s->set_quality(s, JPEG_QUALITY);
+
+    // If you want stable exposure for marker thresholding:
+    s->set_exposure_ctrl(s, 0);
+    s->set_gain_ctrl(s, 0);
+
+    // Start low to reduce hot pixels; raise only if markers too dim.
+    s->set_aec_value(s, 40);  // try 10..120
+    s->set_agc_gain(s, 0);    // try 0..12
+
+    s->set_awb_gain(s, 0);
+    s->set_wb_mode(s, 0);
+    s->set_special_effect(s, 0);
+  }
+
+  // Start tasks
+  xTaskCreatePinnedToCore(capture_task, "capture_task", 8192, nullptr, 3, nullptr, 1);
+  xTaskCreatePinnedToCore(detect_task,  "detect_task",  16384, nullptr, 2, nullptr, 0);
+
+  Serial.println("Running. Prints capture/detect FPS once/sec and last detection at 5 Hz.");
+}
+
+// ===================== Loop =====================
+void loop() {
+  static uint32_t last_cap = 0, last_det = 0;
+  static uint32_t last_ms = 0;
+  static uint32_t last_line_ms = 0;
+
+  uint32_t now = millis();
+  if (last_ms == 0) last_ms = now;
+
+  if (now - last_ms >= 1000) {
+    uint32_t cap = g_capture_count.load(std::memory_order_relaxed);
+    uint32_t det = g_detect_count.load(std::memory_order_relaxed);
+
+    Serial.printf("Capture FPS: %u | Detect FPS: %u\n",
+                  (unsigned)(cap - last_cap),
+                  (unsigned)(det - last_det));
+
+    last_cap = cap;
+    last_det = det;
+    last_ms = now;
+  }
+
+  // Debug: print detection line at 5 Hz (lower if you want even higher perf)
+  if (now - last_line_ms >= 200) {
+    Serial.println(g_last_line);
+    last_line_ms = now;
+  }
+
+  delay(5);
+}
